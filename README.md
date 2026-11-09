@@ -2,7 +2,7 @@
 
 داشبورد مانیتورینگ زنده و تاریخچه‌دار برای سرور لینوکسی. نمایش CPU، RAM، دیسک، ترافیک، آپتایم، بار سیستم، موقعیت سرور، پینگ به چند کشور با جیتر و افت بسته، سرویس‌ها و هشدار تلگرام.
 
-ساخته‌شده توسط **[ArshamSmok](https://github.com/arshamsmok)** · نسخه **v1.3.0** · [تغییرات نسخه‌ها](CHANGELOG.md)
+ساخته‌شده توسط **[ArshamSmok](https://github.com/arshamsmok)** · نسخه **v1.3.1** · [تغییرات نسخه‌ها](CHANGELOG.md)
 
 ![داشبورد ServerPulse](screenshots/dashboard.png)
 

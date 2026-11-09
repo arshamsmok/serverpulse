@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ServerPulse - نصب خودکار
-# ساخته‌شده توسط ArshamSmok · https://github.com/arshamsmok/serverpulse
+# ServerPulse installer
+# Created by ArshamSmok · https://github.com/arshamsmok/serverpulse
 set -euo pipefail
 
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/arshamsmok/serverpulse/main}"
@@ -10,18 +10,30 @@ DATA_DIR="${DATA_DIR:-/var/lib/serverpulse}"
 CONF_FILE="$CONF_DIR/config.json"
 PORT="${PORT:-8585}"
 
-# app.py را از کنار این اسکریپت برمی‌دارد؛ اگر نبود (مثلاً اجرای یک‌خطی) از گیت‌هاب دانلود می‌کند
+info() { echo "==> $*"; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+# Use app.py next to this script if it exists; otherwise download it from GitHub
 fetch_app() {
   local src_dir="$1" dest="$2"
   if [ -f "$src_dir/app.py" ]; then
     cp "$src_dir/app.py" "$dest"
   else
-    echo ">> دانلود app.py از گیت‌هاب..."
-    curl -fsSL "$REPO_RAW/app.py" -o "$dest"
+    info "Downloading app.py from GitHub..."
+    curl -fsSL "$REPO_RAW/app.py" -o "$dest" \
+      || fail "Could not download app.py from GitHub. Check the internet connection."
   fi
 }
 
-# ساخت config.json: رمز هش‌شده، کلید نشست تصادفی، تاریخچه، سرویس‌ها و هشدار
+# Make sure the server can reach PyPI before installing anything
+check_internet() {
+  info "Checking internet connection..."
+  if ! curl -fsS --max-time 10 -o /dev/null https://pypi.org/simple/flask/; then
+    fail "Cannot reach pypi.org. Check the server's internet connection and DNS, then run the installer again."
+  fi
+}
+
+# Write config.json: hashed password, session key, history, services and alerts
 # write_config USER PASS PORT CONF_PATH TG_TOKEN TG_CHAT
 write_config() {
   local user="$1" pass="$2" port="$3" conf="$4" tg_token="$5" tg_chat="$6"
@@ -87,73 +99,79 @@ public_ip() {
 
 main() {
   if [ "$(id -u)" -ne 0 ]; then
-    echo "این اسکریپت باید با sudo اجرا شود."
-    exit 1
+    fail "Please run with sudo: sudo bash install.sh"
   fi
 
   local src_dir
   src_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 
   local username password generated=0 tg_token tg_chat
-  read -r -p "نام کاربری ورود [admin]: " username
+  read -r -p "Admin username [admin]: " username
   username="${username:-admin}"
-  read -r -s -p "رمز عبور (خالی = رمز تصادفی): " password
+  read -r -s -p "Password (leave empty for a random one): " password
   echo
   if [ -z "$password" ]; then
     password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')"
     generated=1
   fi
 
-  echo "هشدار تلگرام (اختیاری؛ برای رد کردن Enter بزنید):"
-  read -r -s -p "  توکن ربات: " tg_token
+  echo "Telegram alerts (optional, press Enter to skip):"
+  read -r -s -p "  Bot token: " tg_token
   echo
   read -r -p "  Chat ID: " tg_chat
 
-  echo ">> نصب پیش‌نیازها..."
-  apt-get update -y
+  check_internet
+
+  info "Installing system packages..."
+  apt-get update -y || fail "apt-get update failed. Check the internet connection."
   apt-get install -y python3-venv python3-pip iputils-ping curl
 
-  echo ">> آماده‌سازی فایل‌ها..."
+  info "Preparing files..."
   mkdir -p "$INSTALL_DIR" "$CONF_DIR" "$DATA_DIR"
   fetch_app "$src_dir" "$INSTALL_DIR/app.py"
 
-  echo ">> نصب وابستگی‌های پایتون..."
+  info "Installing Python packages (flask, psutil)..."
   python3 -m venv "$INSTALL_DIR/venv"
-  "$INSTALL_DIR/venv/bin/pip" install --quiet flask psutil
+  "$INSTALL_DIR/venv/bin/pip" install --quiet --retries 3 --timeout 30 flask psutil \
+    || fail "Could not install Python packages. Check the internet connection and run the installer again."
 
-  echo ">> ساخت تنظیمات..."
+  info "Writing configuration..."
   write_config "$username" "$password" "$PORT" "$CONF_FILE" "$tg_token" "$tg_chat"
 
-  echo ">> راه‌اندازی سرویس..."
+  info "Starting the ServerPulse service..."
   write_service
   systemctl daemon-reload
   systemctl enable serverpulse >/dev/null
   systemctl restart serverpulse
+  sleep 3
+  if ! systemctl is-active --quiet serverpulse; then
+    fail "The service did not start. Run: sudo journalctl -u serverpulse -n 50"
+  fi
 
   local ip
   ip="$(public_ip)"
   echo
   echo "============================================"
-  echo " ServerPulse نصب شد"
-  echo " لینک ورود : http://$ip:$PORT/"
-  echo " نام کاربری: $username"
+  echo " ServerPulse is installed and running"
+  echo " Login URL : http://$ip:$PORT/"
+  echo " Username  : $username"
   if [ "$generated" -eq 1 ]; then
-    echo " رمز عبور : $password"
-    echo " (این رمز فقط همین یک بار نمایش داده می‌شود)"
+    echo " Password  : $password"
+    echo " (This password is shown only once)"
   else
-    echo " رمز عبور : همان رمزی که وارد کردید"
+    echo " Password  : the one you entered"
   fi
   if [ -n "$tg_token" ] && [ -n "$tg_chat" ]; then
-    echo " هشدار تلگرام: فعال"
+    echo " Telegram alerts: enabled"
   else
-    echo " هشدار تلگرام: غیرفعال (بعداً در $CONF_FILE تنظیم کنید)"
+    echo " Telegram alerts: disabled (set them later in $CONF_FILE)"
   fi
   echo "============================================"
-  echo "نکته: اتصال HTTP است. برای امنیت بیشتر پشت Nginx با HTTPS قرار دهید."
-  echo "اگر فایروال فعال است: sudo ufw allow $PORT/tcp"
+  echo "Note: the connection is HTTP. For better security, put it behind Nginx with HTTPS."
+  echo "If a firewall is active, allow the port: sudo ufw allow $PORT/tcp"
 }
 
-# فقط وقتی مستقیم اجرا شود main را صدا بزن (برای تست با source هم امکان‌پذیر است)
+# Run main only when this file is executed directly (not when sourced for tests)
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
   main "$@"
 fi

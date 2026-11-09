@@ -16,7 +16,7 @@ from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 HOST = socket.gethostname()
 
 # تنظیمات از فایلی خوانده می‌شود که install.sh می‌سازد
@@ -453,7 +453,8 @@ PAGE = """<!doctype html>
     color:var(--muted);cursor:pointer;transition:transform .2s,background .2s,color .2s}
   .seg button:hover{transform:scale(1.06);color:#fff}
   .seg button.on{background:rgba(255,255,255,.2);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
-  .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;padding:14px 28px 0}
+  .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;padding:14px 28px 0}
+  @media (max-width:760px){.charts{grid-template-columns:minmax(0,1fr)}}
   .chart-box h3{margin:0 0 8px;font-size:14px;font-weight:600;color:var(--c1)}
   #map{height:320px;border-radius:14px;overflow:hidden}
   .leaflet-container{background:#0b1220}
@@ -721,7 +722,7 @@ const fmtRate = b => {
   return b.toFixed(1) + " " + u[i];
 };
 const fmtUptime = s =>
-  `${Math.floor(s / 86400)} روز ${Math.floor(s % 86400 / 3600)} ساعت ${Math.floor(s % 3600 / 60)} دقیقه`;
+  `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
 const setBar = (id, pct) => $(id).style.width = Math.min(pct, 100) + "%";
 const push = (chart, vals) => {
   chart.data.datasets.forEach((d, i) => { d.data.push(vals[i]); d.data.shift(); });
