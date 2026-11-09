@@ -33,6 +33,16 @@ check_internet() {
   fi
 }
 
+# Copy a file from the local folder, or download it from GitHub
+fetch_file() {
+  local src_dir="$1" name="$2" dest="$3"
+  if [ -f "$src_dir/$name" ]; then
+    cp "$src_dir/$name" "$dest"
+  else
+    curl -fsSL "$REPO_RAW/$name" -o "$dest" || fail "Could not download $name from GitHub."
+  fi
+}
+
 # Write config.json: hashed password, session key, history, services and alerts
 # write_config USER PASS PORT CONF_PATH TG_TOKEN TG_CHAT
 write_config() {
@@ -129,6 +139,9 @@ main() {
   info "Preparing files..."
   mkdir -p "$INSTALL_DIR" "$CONF_DIR" "$DATA_DIR"
   fetch_app "$src_dir" "$INSTALL_DIR/app.py"
+  fetch_file "$src_dir" manage.py "$INSTALL_DIR/manage.py"
+  fetch_file "$src_dir" serverpulse.sh /usr/local/bin/serverpulse
+  chmod 755 /usr/local/bin/serverpulse
 
   info "Installing Python packages (flask, psutil)..."
   python3 -m venv "$INSTALL_DIR/venv"
@@ -167,6 +180,7 @@ main() {
     echo " Telegram alerts: disabled (set them later in $CONF_FILE)"
   fi
   echo "============================================"
+  echo "Control menu: sudo serverpulse"
   echo "Note: the connection is HTTP. For better security, put it behind Nginx with HTTPS."
   echo "If a firewall is active, allow the port: sudo ufw allow $PORT/tcp"
 }

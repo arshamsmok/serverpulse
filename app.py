@@ -17,7 +17,7 @@ from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 HOST = socket.gethostname()
 CORES = psutil.cpu_count() or 1
 
@@ -37,16 +37,71 @@ BACKGROUND = CFG.get("background_image", "") or ""
 if not re.fullmatch(r"https?://[^\s\"'<>(){}\\]+", BACKGROUND):
     BACKGROUND = ""
 
-# Ping targets. lat/lng are only used for the map.
-# Anycast IPs such as 1.1.1.1 have no coordinates because they reach the nearest data center.
-TARGETS = [
-    {"ip": "8.8.8.8",      "name": "Google DNS", "country": "United States", "code": "US",  "lat": 37.42,  "lng": -122.08},
-    {"ip": "9.9.9.9",      "name": "Quad9",      "country": "Switzerland",   "code": "CH",  "lat": 47.37,  "lng": 8.54},
-    {"ip": "77.88.8.8",    "name": "Yandex DNS", "country": "Russia",        "code": "RU",  "lat": 55.75,  "lng": 37.62},
-    {"ip": "223.5.5.5",    "name": "AliDNS",     "country": "China",         "code": "CN",  "lat": 30.29,  "lng": 120.16},
-    {"ip": "168.126.63.1", "name": "KT DNS",     "country": "South Korea",   "code": "KR",  "lat": 37.57,  "lng": 126.98},
-    {"ip": "1.1.1.1",      "name": "Cloudflare", "country": "Global",        "code": "ANY", "lat": None,   "lng": None},
+# ---------- Access control (panel only) ----------
+
+def _nets(items):
+    out = []
+    for x in items or []:
+        try:
+            out.append(ipaddress.ip_network(str(x), strict=False))
+        except ValueError:
+            pass
+    return out
+
+
+ALLOW_NETS = _nets(CFG.get("allow_ips"))
+DENY_NETS = _nets(CFG.get("deny_ips"))
+ALLOWED_HOSTS = {str(h).lower() for h in (CFG.get("allowed_hosts") or []) if str(h).strip()}
+
+
+def _in_nets(ip, nets):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in n for n in nets)
+
+
+@app.before_request
+def access_guard():
+    ip = request.remote_addr or ""
+    if _in_nets(ip, DENY_NETS):
+        return Response("Forbidden", 403, mimetype="text/plain")
+    if ALLOW_NETS and not _in_nets(ip, ALLOW_NETS):
+        return Response("Forbidden", 403, mimetype="text/plain")
+    if ALLOWED_HOSTS and request.host.split(":")[0].lower() not in ALLOWED_HOSTS:
+        return Response("Forbidden", 403, mimetype="text/plain")
+
+
+# ---------- Ping targets ----------
+# lat/lng are only used for the map. Anycast IPs (such as 8.8.8.8 and 1.1.1.1) reach the nearest data center.
+DEFAULT_TARGETS = [
+    {"ip": "8.8.8.8", "name": "Google DNS", "country": "United States", "country_fa": "آمریکا", "code": "US", "lat": 37.42, "lng": -122.08},
+    {"ip": "9.9.9.9", "name": "Quad9", "country": "Switzerland", "country_fa": "سوئیس", "code": "CH", "lat": 47.37, "lng": 8.54},
+    {"ip": "77.88.8.8", "name": "Yandex DNS", "country": "Russia", "country_fa": "روسیه", "code": "RU", "lat": 55.75, "lng": 37.62},
+    {"ip": "223.5.5.5", "name": "AliDNS", "country": "China", "country_fa": "چین", "code": "CN", "lat": 30.29, "lng": 120.16},
+    {"ip": "168.126.63.1", "name": "KT DNS", "country": "South Korea", "country_fa": "کره جنوبی", "code": "KR", "lat": 37.57, "lng": 126.98},
+    {"ip": "213.133.98.98", "name": "Hetzner DNS", "country": "Germany", "country_fa": "آلمان", "code": "DE", "lat": 49.45, "lng": 11.08},
+    {"ip": "193.110.81.0", "name": "dns0.eu", "country": "Netherlands", "country_fa": "هلند", "code": "NL", "lat": 52.37, "lng": 4.90},
+    {"ip": "80.67.169.12", "name": "FDN DNS", "country": "France", "country_fa": "فرانسه", "code": "FR", "lat": 48.85, "lng": 2.35},
+    {"ip": "1.1.1.1", "name": "Cloudflare", "country": "Global", "country_fa": "جهانی", "code": "ANY", "lat": None, "lng": None},
 ]
+
+
+def _normalize(t):
+    return {
+        "ip": str(t["ip"]),
+        "name": str(t.get("name", t["ip"])),
+        "country": str(t.get("country", "Unknown")),
+        "country_fa": str(t.get("country_fa", t.get("country", ""))),
+        "code": str(t.get("code", "ANY"))[:3].upper(),
+        "lat": t.get("lat"),
+        "lng": t.get("lng"),
+    }
+
+
+# Extra targets can be added in config.json under "targets" (each needs "ip", "name", "country", "code")
+TARGETS = [_normalize(t) for t in (CFG.get("targets") or DEFAULT_TARGETS) if t.get("ip")]
 
 PING_INTERVAL = 30
 PING_COUNT = 5
@@ -85,10 +140,8 @@ LOSS_RE = re.compile(r"([\d.]+)% packet loss")
 def ping_host(host, count=PING_COUNT):
     """Multi-packet ping: returns average, jitter (mdev) and packet loss percent."""
     try:
-        out = subprocess.run(
-            ["ping", "-c", str(count), "-W", "2", host],
-            capture_output=True, text=True, timeout=20
-        ).stdout
+        out = subprocess.run(["ping", "-c", str(count), "-W", "2", host],
+                             capture_output=True, text=True, timeout=20).stdout
     except Exception:
         return {"avg": None, "jitter": None, "loss": 100.0}
     loss_m = LOSS_RE.search(out)
@@ -96,9 +149,7 @@ def ping_host(host, count=PING_COUNT):
     rtt = RTT_RE.search(out)
     if not rtt:
         return {"avg": None, "jitter": None, "loss": loss}
-    return {"avg": round(float(rtt.group(2)), 1),
-            "jitter": round(float(rtt.group(4)), 1),
-            "loss": loss}
+    return {"avg": round(float(rtt.group(2)), 1), "jitter": round(float(rtt.group(4)), 1), "loss": loss}
 
 
 def _probe(ip):
@@ -259,8 +310,7 @@ def send_telegram(text):
         return False
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     try:
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage",
-                               data=data, timeout=10)
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=10)
         return True
     except Exception as e:
         print("telegram error:", type(e).__name__, flush=True)
@@ -270,9 +320,7 @@ def send_telegram(text):
 def describe(key, value, thr, down):
     if key.startswith("down:"):
         name = key[5:]
-        if down:
-            return f"[{HOST}] Ping to {name} is down"
-        return f"[{HOST}] Ping to {name} recovered"
+        return f"[{HOST}] Ping to {name} is {'down' if down else 'back up'}"
     label = {"cpu": "CPU", "ram": "Memory", "disk": "Disk"}[key]
     if down:
         return f"[{HOST}] {label} reached {value:.1f}% (threshold {thr}%)"
@@ -323,7 +371,7 @@ def stats():
     with _snap_lock:
         snap = _snap["value"]
     if not snap:
-        return jsonify({"error": "warming up"}), 503
+        return jsonify({"error": "warming_up"}), 503
     return jsonify(snap)
 
 
@@ -361,20 +409,20 @@ def valid_host(h):
 @app.route("/api/check", methods=["POST"])
 @login_required
 def check():
-    """Checks one IP or domain: ping and an optional TCP port. Limited to one check every 3 seconds."""
+    """Checks one IP or domain: ping plus an optional TCP port. One check every 3 seconds."""
     data = request.get_json(silent=True) or {}
     host = str(data.get("host", "")).strip()
     port_raw = str(data.get("port", "")).strip()
     if not valid_host(host):
-        return jsonify({"error": "Enter a valid IP address or domain name."}), 400
+        return jsonify({"error": "invalid_host"}), 400
     port = None
     if port_raw:
         if not port_raw.isdigit() or not (1 <= int(port_raw) <= 65535):
-            return jsonify({"error": "Port must be between 1 and 65535."}), 400
+            return jsonify({"error": "invalid_port"}), 400
         port = int(port_raw)
     with _check_lock:
         if time.time() - _check_state["last"] < 3:
-            return jsonify({"error": "Please wait a few seconds between checks."}), 429
+            return jsonify({"error": "rate"}), 429
         _check_state["last"] = time.time()
 
     ping = ping_host(host, count=3)
@@ -391,123 +439,69 @@ def check():
     return jsonify(res)
 
 
-BASE_CSS = """
-  :root{--text:#e6edf3;--muted:#8b98a9;--accent:#22d3ee;--accent2:#5eead4;--good:#34d399;--line:rgba(148,163,184,.12)}
-  *{box-sizing:border-box}
-  html{min-height:100%;background:#070c17;color-scheme:dark}
-  body{margin:0;min-height:100vh;color:var(--text);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
-  body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;opacity:.85;{{bg}}}
-  body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
-    background:radial-gradient(ellipse at 15% 0%,rgba(34,211,238,.10),transparent 55%),
-      radial-gradient(ellipse at 100% 100%,rgba(94,234,212,.06),transparent 50%),
-      linear-gradient(180deg,rgba(7,12,23,.55),rgba(7,12,23,.92))}
-  .glass{background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.025));
-    -webkit-backdrop-filter:blur(16px) saturate(120%);backdrop-filter:blur(16px) saturate(120%);
-    box-shadow:0 18px 40px rgba(0,0,0,.35);border-radius:22px}
-  .lift{transition:transform .25s ease,box-shadow .25s ease}
-  .lift:hover{transform:translateY(-2px);box-shadow:0 22px 48px rgba(0,0,0,.45)}
-  .inp{width:100%;padding:11px 14px;border:0;border-radius:12px;color:#f8fafc;font:inherit;background:rgba(255,255,255,.06);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
-  .inp:focus{outline:none;box-shadow:0 0 0 2px rgba(34,211,238,.45)}
-  .btn{padding:11px 18px;border:0;border-radius:12px;background:var(--accent2);color:#06202a;font:inherit;font-weight:600;cursor:pointer;transition:filter .2s}
-  .btn:hover{filter:brightness(1.08)}
-  .btn:disabled{opacity:.5;cursor:default}
-  .badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);padding:5px 10px;border-radius:999px;background:rgba(94,234,212,.1)}
-"""
+# ---------- Translations (shared by login and dashboard) ----------
 
-LOGIN_CSS = """{{base}}
-  body{display:grid;place-items:center;padding:28px}
-  .wrap{width:min(1080px,100%);display:grid;grid-template-columns:1.1fr .9fr;gap:56px;align-items:center}
-  .brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:17px}
-  .brand small{display:block;font-size:10px;letter-spacing:.2em;color:var(--muted);font-weight:500}
-  .mark{width:12px;height:12px;border-radius:50%;background:var(--accent);box-shadow:0 0 18px var(--accent)}
-  .eyebrow{margin-top:64px;color:var(--accent2);font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:600}
-  h1.hero{margin:14px 0;font-size:46px;line-height:1.08;font-weight:700;letter-spacing:-.02em}
-  h1.hero span{color:var(--accent)}
-  .lead{color:var(--muted);max-width:520px;font-size:15px;margin:0}
-  .features{margin-top:34px;border-top:1px solid var(--line)}
-  .feat{padding:16px 0;border-bottom:1px solid var(--line)}
-  .feat b{display:block;font-weight:600}
-  .feat span{color:var(--muted);font-size:13px}
-  .form{padding:34px 32px}
-  .form h2{margin:14px 0 4px;font-size:24px;font-weight:700}
-  .form .note{color:var(--muted);margin:0 0 22px;font-size:13px}
-  label{display:block;font-size:12.5px;color:var(--muted);margin:16px 0 7px}
-  .primary{margin-top:24px;width:100%;padding:13px;border:0;border-radius:12px;color:#06202a;font:inherit;font-weight:600;background:var(--accent2);cursor:pointer;transition:filter .2s}
-  .primary:hover{filter:brightness(1.08)}
-  .err{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
-  @media (max-width:860px){.wrap{grid-template-columns:1fr;gap:28px}h1.hero{font-size:32px}.eyebrow{margin-top:24px}}
-"""
+I18N_JS = """const I18N = {
+en: {nav_overview:"Overview",nav_network:"Network",nav_resources:"Resources",nav_latency:"Latency",nav_history:"History",nav_tools:"Tools",
+signout:"Sign out",connecting:"Connecting…",online:"Online",disconnected:"Disconnected",
+h_overview:"Overview",p_overview:"Live server status, refreshed every 2 seconds",
+cpu:"CPU",memory:"Memory",disk:"Disk",avg_latency:"Average latency",download:"Download",upload:"Upload",uptime:"Uptime",load:"Load",
+loc_title:"Server location",loc_unknown:"Unknown",loc_unavail:"Location lookup unavailable (no internet or ip-api limit)",
+services_title:"Services",no_services:"No services configured",
+h_network:"Network",p_network:"Download and upload throughput, live",ch_traffic:"Traffic (KB/s)",
+h_resources:"Resources",p_resources:"CPU and memory usage, and the processes using them",ch_cpu_mem:"CPU and memory (%)",
+procs_title:"Top processes",sorted_cpu:"sorted by CPU",th_pid:"PID",th_name:"Name",th_cpu:"CPU %",th_mem:"Memory %",collecting:"Collecting data…",
+h_latency:"Latency",p_latency:"Ping to remote targets: 5 packets every 30 seconds",lat_title:"Latency by country (ms)",
+map_title:"Map",map_hint:"color = latency",targets_title:"Targets",
+th_country:"Country",th_service:"Service",th_ip:"IP",th_latency:"Latency",th_jitter:"Jitter",th_loss:"Loss",timeout:"timeout",
+h_history:"History",p_history:"Stored every 60 seconds, kept for 8 days",range:"Range",ch_history_cpu:"CPU and memory (%)",ch_history_net:"Network (KB/s)",
+h_tools:"Tools",p_tools:"Check an IP address or domain from this server. One check every 3 seconds.",
+tools_host:"IP address or domain",tools_port:"TCP port (optional)",run_check:"Run check",
+r_target:"Target",r_ping:"Average ping",r_loss:"Packet loss",r_port:"TCP port",not_tested:"not tested",open:"open",closed:"closed",
+e_invalid_host:"Enter a valid IP address or domain name.",e_invalid_port:"Port must be between 1 and 65535.",
+e_rate:"Please wait a few seconds between checks.",e_request:"Request failed. Check the server connection.",
+e_invalid:"Invalid username or password",e_locked:"Too many failed attempts. Try again in a minute.",
+ch_cpu:"CPU %",ch_mem:"Memory %",ch_down:"Download",ch_up:"Upload",
+st_active:"active",st_inactive:"inactive",st_failed:"failed",st_unknown:"unknown",
+l_eyebrow:"Control · Clarity · Confidence",l_hero1:"Your servers.",l_hero2:"In real time.",
+l_lead:"Health, network activity, latency and services of your server in one clean dashboard.",
+l_f1_t:"Live system telemetry",l_f1_s:"CPU, memory, disk, uptime and network signals",
+l_f2_t:"Protected dashboard",l_f2_s:"Private access with rate-limited sign-in",
+l_secure:"Secure session",l_title:"Sign in to continue",l_note:"Enter your administrator credentials.",
+l_user:"Username",l_pass:"Password",l_signin:"Sign in",l_brand_sub:"SERVER MONITORING",
+footer:"ServerPulse v{v} · by ArshamSmok"},
+fa: {nav_overview:"نمای کلی",nav_network:"شبکه",nav_resources:"منابع",nav_latency:"تأخیر",nav_history:"تاریخچه",nav_tools:"ابزارها",
+signout:"خروج",connecting:"در حال اتصال…",online:"آنلاین",disconnected:"قطع اتصال",
+h_overview:"نمای کلی",p_overview:"وضعیت زنده سرور، هر ۲ ثانیه به‌روز می‌شود",
+cpu:"پردازنده",memory:"حافظه",disk:"دیسک",avg_latency:"میانگین تأخیر",download:"دریافت",upload:"ارسال",uptime:"مدت روشن بودن",load:"بار",
+loc_title:"موقعیت سرور",loc_unknown:"نامشخص",loc_unavail:"دریافت موقعیت ممکن نیست (اینترنت یا محدودیت ip-api)",
+services_title:"سرویس‌ها",no_services:"سرویسی تنظیم نشده است",
+h_network:"شبکه",p_network:"سرعت دریافت و ارسال به‌صورت زنده",ch_traffic:"ترافیک (KB/s)",
+h_resources:"منابع",p_resources:"مصرف پردازنده و حافظه و فرایندهای پرمصرف",ch_cpu_mem:"پردازنده و حافظه (%)",
+procs_title:"فرایندهای پرمصرف",sorted_cpu:"مرتب‌شده بر اساس CPU",th_pid:"PID",th_name:"نام",th_cpu:"CPU %",th_mem:"حافظه %",collecting:"در حال جمع‌آوری…",
+h_latency:"تأخیر",p_latency:"پینگ به مقصدهای خارجی: ۵ بسته هر ۳۰ ثانیه",lat_title:"تأخیر به تفکیک کشور (ms)",
+map_title:"نقشه",map_hint:"رنگ = تأخیر",targets_title:"مقصدها",
+th_country:"کشور",th_service:"سرویس",th_ip:"IP",th_latency:"تأخیر",th_jitter:"جیتر",th_loss:"افت بسته",timeout:"بدون پاسخ",
+h_history:"تاریخچه",p_history:"هر ۶۰ ثانیه ذخیره می‌شود و ۸ روز نگه داشته می‌شود",range:"بازه",
+ch_history_cpu:"پردازنده و حافظه (%)",ch_history_net:"شبکه (KB/s)",
+h_tools:"ابزارها",p_tools:"بررسی IP یا دامنه از این سرور. هر ۳ ثانیه یک بررسی.",
+tools_host:"آدرس IP یا دامنه",tools_port:"پورت TCP (اختیاری)",run_check:"اجرای بررسی",
+r_target:"مقصد",r_ping:"میانگین پینگ",r_loss:"افت بسته",r_port:"پورت TCP",not_tested:"انجام نشد",open:"باز",closed:"بسته",
+e_invalid_host:"آدرس IP یا دامنه معتبر وارد کنید.",e_invalid_port:"پورت باید بین ۱ و ۶۵۵۳۵ باشد.",
+e_rate:"بین بررسی‌ها چند ثانیه صبر کنید.",e_request:"درخواست ناموفق بود. اتصال سرور را بررسی کنید.",
+e_invalid:"نام کاربری یا رمز عبور اشتباه است",e_locked:"تلاش‌های ناموفق زیاد بود. یک دقیقه دیگر امتحان کنید.",
+ch_cpu:"پردازنده %",ch_mem:"حافظه %",ch_down:"دریافت",ch_up:"ارسال",
+st_active:"فعال",st_inactive:"غیرفعال",st_failed:"خطا",st_unknown:"نامشخص",
+l_eyebrow:"کنترل · شفافیت · اطمینان",l_hero1:"سرورهای شما.",l_hero2:"لحظه به لحظه.",
+l_lead:"سلامت، فعالیت شبکه، تأخیر و سرویس‌های سرور خود را در یک داشبورد ساده ببینید.",
+l_f1_t:"تله‌متری زنده سیستم",l_f1_s:"پردازنده، حافظه، دیسک، مدت روشن بودن و وضعیت شبکه",
+l_f2_t:"داشبورد محافظت‌شده",l_f2_s:"دسترسی خصوصی با محدودیت تعداد ورود",
+l_secure:"نشست امن",l_title:"برای ادامه وارد شوید",l_note:"اطلاعات مدیر را وارد کنید.",
+l_user:"نام کاربری",l_pass:"رمز عبور",l_signin:"ورود",l_brand_sub:"پایش سرور",
+footer:"ServerPulse نسخه {v} · ساخته‌شده توسط ArshamSmok"}
+};"""
 
-PAGE_CSS = """{{base}}
-  .app{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
-  .sidebar{position:sticky;top:14px;align-self:start;height:calc(100vh - 28px);margin:14px 0 14px 14px;padding:24px 16px;display:flex;flex-direction:column;gap:24px}
-  .brand{font-weight:700;font-size:16px;padding:0 10px}
-  .brand b{color:var(--accent);font-weight:700}
-  .nav{display:flex;flex-direction:column;gap:4px}
-  .nav a{display:flex;gap:12px;align-items:center;color:var(--muted);text-decoration:none;padding:10px 12px;border-radius:12px;font-size:13.5px;transition:background .2s,color .2s}
-  .nav a i{font-style:normal;font-size:11px;color:#55657a;width:20px;font-variant-numeric:tabular-nums}
-  .nav a:hover{color:var(--text);background:rgba(255,255,255,.05)}
-  .nav a.active{color:#ecfeff;background:rgba(34,211,238,.12)}
-  .nav a.active i{color:var(--accent)}
-  .side-foot{margin-top:auto;padding:0 10px;font-size:12.5px;color:var(--muted);display:flex;flex-direction:column;gap:12px}
-  .side-foot a{color:var(--muted);text-decoration:none}
-  .side-foot a:hover{color:var(--text)}
-  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);margin-right:6px}
-  main{padding:26px 30px 8px;min-width:0}
-  .head{margin:0 0 20px}
-  .head h1{margin:0;font-size:24px;font-weight:700;letter-spacing:-.01em}
-  .head p{margin:4px 0 0;color:var(--muted);font-size:13px}
-  .page{display:none}
-  .page.show{display:block}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:14px}
-  .card{padding:18px 20px}
-  .label{font-size:12.5px;color:var(--muted)}
-  .value{font-size:26px;font-weight:600;margin-top:8px;direction:ltr;text-align:left;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
-  .value.sm{font-size:18px}
-  .meter{height:4px;background:rgba(255,255,255,.07);border-radius:99px;margin-top:14px;overflow:hidden}
-  .meter i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .6s ease}
-  .hint{font-size:12px;color:var(--muted);margin-top:6px;direction:ltr;text-align:left}
-  .panel{padding:20px 22px;margin-bottom:14px}
-  .panel h3{margin:0 0 14px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px}
-  .panel h3 small{color:var(--muted);font-weight:400;font-size:12px}
-  .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
-  .row2 .panel{margin-bottom:0}
-  .chart{position:relative;height:300px}
-  .chips{display:flex;flex-wrap:wrap;gap:8px}
-  .chip{display:inline-flex;align-items:center;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.05);font-size:12.5px}
-  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-  .toolbar h2{margin:0;font-size:15px;font-weight:600}
-  .seg{display:inline-flex;padding:4px;border-radius:12px;background:rgba(255,255,255,.05)}
-  .seg button{border:0;background:transparent;color:var(--muted);padding:6px 14px;border-radius:9px;font:inherit;font-size:12.5px;cursor:pointer}
-  .seg button.on{background:rgba(34,211,238,.14);color:#ecfeff}
-  #map{height:320px;border-radius:16px;overflow:hidden}
-  .leaflet-container{background:#0b1220;font-family:inherit}
-  .leaflet-tile{filter:grayscale(.8) brightness(.55) contrast(1.1)}
-  .table-wrap{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{padding:10px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
-  th{color:var(--muted);font-weight:500;font-size:12px}
-  td{direction:ltr}
-  .code{display:inline-block;min-width:30px;color:var(--accent);font-weight:600;font-size:12px}
-  .pd{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;vertical-align:middle}
-  .form-row{display:grid;grid-template-columns:minmax(0,1fr) 140px auto;gap:12px;align-items:end}
-  .form-row label{margin:0 0 7px}
-  .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:18px}
-  .results div{padding:16px 18px;border-radius:16px;background:rgba(255,255,255,.04)}
-  .results b{display:block;font-size:20px;font-weight:600;margin-top:6px;direction:ltr;text-align:left;font-variant-numeric:tabular-nums;word-break:break-all}
-  .msg{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
-  footer{color:var(--muted);font-size:12px;padding:8px 0 22px}
-  @media (max-width:980px){
-    .app{grid-template-columns:1fr}
-    .sidebar{position:sticky;top:0;z-index:5;height:auto;margin:0;border-radius:0;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px}
-    .nav{flex-direction:row;flex-wrap:wrap}
-    .side-foot{margin:0 0 0 auto;flex-direction:row;align-items:center}
-    main{padding:18px}
-    .row2{grid-template-columns:1fr}
-    .form-row{grid-template-columns:1fr}
-  }
-  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
-"""
+# ---------- Styles ----------
 
 _TOPO_SVG = (
     "<svg xmlns='http://www.w3.org/2000/svg' width='600' height='400'>"
@@ -530,41 +524,185 @@ else:
     BG_LAYER = ('background-image:url("data:image/svg+xml;utf8,%s");'
                 'background-size:600px 400px' % urllib.parse.quote(_TOPO_SVG))
 
+BASE_CSS = """
+  :root{--text:#e6edf3;--muted:#8b98a9;--accent:#22d3ee;--accent2:#5eead4;--good:#34d399;--line:rgba(148,163,184,.12)}
+  *{box-sizing:border-box}
+  html{min-height:100%;background:#070c17;color-scheme:dark}
+  html[lang=fa] body{font-family:Vazirmatn,Inter,system-ui,sans-serif}
+  body{margin:0;min-height:100vh;color:var(--text);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+  body::before{content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;opacity:.85;{{bg}}}
+  body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+    background:radial-gradient(ellipse at 15% 0%,rgba(34,211,238,.10),transparent 55%),
+      radial-gradient(ellipse at 100% 100%,rgba(94,234,212,.06),transparent 50%),
+      linear-gradient(180deg,rgba(7,12,23,.55),rgba(7,12,23,.92))}
+  .glass{background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.025));
+    -webkit-backdrop-filter:blur(16px) saturate(120%);backdrop-filter:blur(16px) saturate(120%);
+    box-shadow:0 18px 40px rgba(0,0,0,.35);border-radius:22px}
+  .lift{transition:transform .25s ease,box-shadow .25s ease}
+  .lift:hover{transform:translateY(-2px);box-shadow:0 22px 48px rgba(0,0,0,.45)}
+  .inp{width:100%;padding:11px 14px;border:0;border-radius:12px;color:#f8fafc;font:inherit;background:rgba(255,255,255,.06);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+  .inp:focus{outline:none;box-shadow:0 0 0 2px rgba(34,211,238,.45)}
+  .lang{display:inline-flex;padding:3px;border-radius:10px;background:rgba(255,255,255,.06)}
+  .lang button{border:0;background:transparent;color:var(--muted);padding:5px 11px;border-radius:8px;font:inherit;font-size:12px;cursor:pointer}
+  .lang button.on{background:rgba(34,211,238,.14);color:#ecfeff}
+  .badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);padding:5px 10px;border-radius:999px;background:rgba(94,234,212,.1)}
+"""
+
+LOGIN_CSS = """{{base}}
+  body{display:grid;place-items:center;padding:28px}
+  .topbar{position:fixed;top:18px;inset-inline-end:24px}
+  .wrap{width:min(1080px,100%);display:grid;grid-template-columns:1.1fr .9fr;gap:56px;align-items:center}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:17px}
+  .brand small{display:block;font-size:10px;letter-spacing:.2em;color:var(--muted);font-weight:500}
+  .mark{width:12px;height:12px;border-radius:50%;background:var(--accent);box-shadow:0 0 18px var(--accent)}
+  .eyebrow{margin-top:64px;color:var(--accent2);font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:600}
+  h1.hero{margin:14px 0;font-size:46px;line-height:1.08;font-weight:700;letter-spacing:-.02em}
+  h1.hero span.acc{color:var(--accent)}
+  .lead{color:var(--muted);max-width:520px;font-size:15px;margin:0}
+  .features{margin-top:34px;border-top:1px solid var(--line)}
+  .feat{padding:16px 0;border-bottom:1px solid var(--line)}
+  .feat b{display:block;font-weight:600}
+  .feat span{color:var(--muted);font-size:13px}
+  .form{padding:34px 32px}
+  .form h2{margin:14px 0 4px;font-size:24px;font-weight:700}
+  .form .note{color:var(--muted);margin:0 0 22px;font-size:13px}
+  label{display:block;font-size:12.5px;color:var(--muted);margin:16px 0 7px}
+  .primary{margin-top:24px;width:100%;padding:13px;border:0;border-radius:12px;color:#06202a;font:inherit;font-weight:600;background:var(--accent2);cursor:pointer;transition:filter .2s}
+  .primary:hover{filter:brightness(1.08)}
+  .err{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
+  @media (max-width:860px){.wrap{grid-template-columns:1fr;gap:28px}h1.hero{font-size:32px}.eyebrow{margin-top:24px}}
+"""
+
+PAGE_CSS = """{{base}}
+  .app{display:grid;grid-template-columns:236px minmax(0,1fr);min-height:100vh}
+  .sidebar{position:sticky;top:14px;align-self:start;height:calc(100vh - 28px);margin:14px;padding:24px 16px;display:flex;flex-direction:column;gap:24px}
+  .brand{font-weight:700;font-size:16px;padding:0 10px}
+  .brand b{color:var(--accent);font-weight:700}
+  .nav{display:flex;flex-direction:column;gap:4px}
+  .nav a{display:flex;gap:12px;align-items:center;color:var(--muted);text-decoration:none;padding:10px 12px;border-radius:12px;font-size:13.5px;transition:background .2s,color .2s}
+  .nav a i{font-style:normal;font-size:11px;color:#55657a;width:20px;font-variant-numeric:tabular-nums}
+  .nav a:hover{color:var(--text);background:rgba(255,255,255,.05)}
+  .nav a.active{color:#ecfeff;background:rgba(34,211,238,.12)}
+  .nav a.active i{color:var(--accent)}
+  .side-foot{margin-top:auto;padding:0 10px;font-size:12.5px;color:var(--muted);display:flex;flex-direction:column;gap:12px}
+  .side-foot a{color:var(--muted);text-decoration:none}
+  .side-foot a:hover{color:var(--text)}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);margin-inline-end:6px}
+  main{padding:26px 30px 8px;min-width:0}
+  .head{margin:0 0 20px}
+  .head h1{margin:0;font-size:24px;font-weight:700}
+  .head p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  .page{display:none}
+  .page.show{display:block}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:14px}
+  .card{padding:18px 20px}
+  .label{font-size:12.5px;color:var(--muted)}
+  .value{font-size:26px;font-weight:600;margin-top:8px;direction:ltr;text-align:start;font-variant-numeric:tabular-nums}
+  .value.sm{font-size:18px}
+  .meter{height:4px;background:rgba(255,255,255,.07);border-radius:99px;margin-top:14px;overflow:hidden}
+  .meter i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .6s ease}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px;direction:ltr;text-align:start}
+  .panel{padding:20px 22px;margin-bottom:14px}
+  .panel h3{margin:0 0 14px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px}
+  .panel h3 small{color:var(--muted);font-weight:400;font-size:12px}
+  .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .row2 .panel{margin-bottom:0}
+  .chart{position:relative;height:300px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.05);font-size:12.5px}
+  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+  .toolbar h2{margin:0;font-size:15px;font-weight:600}
+  .seg{display:inline-flex;padding:4px;border-radius:12px;background:rgba(255,255,255,.05)}
+  .seg button{border:0;background:transparent;color:var(--muted);padding:6px 14px;border-radius:9px;font:inherit;font-size:12.5px;cursor:pointer}
+  .seg button.on{background:rgba(34,211,238,.14);color:#ecfeff}
+  #map{height:320px;border-radius:16px;overflow:hidden}
+  .leaflet-container{background:#0b1220;font-family:inherit}
+  .leaflet-tile{filter:grayscale(.8) brightness(.55) contrast(1.1)}
+  .table-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:10px 8px;text-align:start;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;font-size:12px}
+  .num{direction:ltr;unicode-bidi:isolate}
+  .code{display:inline-block;min-width:30px;color:var(--accent);font-weight:600;font-size:12px}
+  .pd{display:inline-block;width:8px;height:8px;border-radius:50%;margin-inline-end:8px;vertical-align:middle}
+  .form-row{display:grid;grid-template-columns:minmax(0,1fr) 140px auto;gap:12px;align-items:end}
+  .form-row label{margin:0 0 7px}
+  .results{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:18px}
+  .results div{padding:16px 18px;border-radius:16px;background:rgba(255,255,255,.04)}
+  .results b{display:block;font-size:20px;font-weight:600;margin-top:6px;direction:ltr;text-align:start;font-variant-numeric:tabular-nums;word-break:break-all}
+  .btn{padding:11px 18px;border:0;border-radius:12px;background:var(--accent2);color:#06202a;font:inherit;font-weight:600;cursor:pointer;transition:filter .2s}
+  .btn:hover{filter:brightness(1.08)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .msg{color:#fca5a5;font-size:13px;margin-top:12px;min-height:18px}
+  footer{color:var(--muted);font-size:12px;padding:8px 0 22px}
+  @media (max-width:980px){
+    .app{grid-template-columns:1fr}
+    .sidebar{position:sticky;top:0;z-index:5;height:auto;margin:0;border-radius:0;flex-direction:row;align-items:center;flex-wrap:wrap;padding:12px 14px}
+    .nav{flex-direction:row;flex-wrap:wrap}
+    .side-foot{margin:0 0 0 auto;flex-direction:row;align-items:center;flex-wrap:wrap}
+    main{padding:18px}
+    .row2{grid-template-columns:1fr}
+    .form-row{grid-template-columns:1fr}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+"""
+
 LOGIN_PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>Sign in · ServerPulse</title>
+<title>ServerPulse</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vazirmatn@33.0.3/Vazirmatn-font-face.css">
 <style>
 {{login_css}}
 </style>
 </head>
 <body>
+<div class="topbar"><div class="lang"><button data-lang="en">EN</button><button data-lang="fa">FA</button></div></div>
 <div class="wrap">
   <div>
-    <div class="brand"><span class="mark"></span><div>ServerPulse<small>SERVER MONITORING</small></div></div>
-    <div class="eyebrow">Control · Clarity · Confidence</div>
-    <h1 class="hero">Your servers.<br><span>In real time.</span></h1>
-    <p class="lead">Health, network activity, latency and services of your server in one clean dashboard.</p>
+    <div class="brand"><span class="mark"></span><div>ServerPulse<small data-i18n="l_brand_sub"></small></div></div>
+    <div class="eyebrow" data-i18n="l_eyebrow"></div>
+    <h1 class="hero"><span data-i18n="l_hero1"></span><br><span class="acc" data-i18n="l_hero2"></span></h1>
+    <p class="lead" data-i18n="l_lead"></p>
     <div class="features">
-      <div class="feat"><b>Live system telemetry</b><span>CPU, memory, disk, uptime and network signals</span></div>
-      <div class="feat"><b>Protected dashboard</b><span>Private access with rate-limited sign-in</span></div>
+      <div class="feat"><b data-i18n="l_f1_t"></b><span data-i18n="l_f1_s"></span></div>
+      <div class="feat"><b data-i18n="l_f2_t"></b><span data-i18n="l_f2_s"></span></div>
     </div>
   </div>
   <form class="glass form" method="post" action="login">
-    <span class="badge">Secure session</span>
-    <h2>Sign in to continue</h2>
-    <p class="note">Enter your administrator credentials.</p>
-    <label for="u">Username</label>
+    <span class="badge" data-i18n="l_secure"></span>
+    <h2 data-i18n="l_title"></h2>
+    <p class="note" data-i18n="l_note"></p>
+    <label for="u" data-i18n="l_user"></label>
     <input id="u" class="inp" name="username" autocomplete="username" required autofocus>
-    <label for="p">Password</label>
+    <label for="p" data-i18n="l_pass"></label>
     <input id="p" class="inp" name="password" type="password" autocomplete="current-password" required>
-    <button class="primary" type="submit">Sign in</button>
-    <div class="err">{{error}}</div>
+    <button class="primary" type="submit" data-i18n="l_signin"></button>
+    <div class="err" id="err" data-err="{{error}}"></div>
   </form>
 </div>
+<script>
+{{i18n}}
+let LANG = localStorage.getItem("sp-lang") || "en";
+const T = k => (I18N[LANG] && I18N[LANG][k]) || I18N.en[k] || k;
+function applyLang() {
+  document.documentElement.lang = LANG;
+  document.documentElement.dir = LANG === "fa" ? "rtl" : "ltr";
+  document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = T(el.dataset.i18n));
+  document.querySelectorAll(".lang button").forEach(b => b.classList.toggle("on", b.dataset.lang === LANG));
+  const e = document.getElementById("err");
+  if (e.dataset.err) e.textContent = T("e_" + e.dataset.err);
+}
+document.querySelectorAll(".lang button").forEach(b => b.addEventListener("click", () => {
+  LANG = b.dataset.lang;
+  localStorage.setItem("sp-lang", LANG);
+  applyLang();
+}));
+applyLang();
+</script>
 </body>
 </html>"""
 
@@ -575,6 +713,7 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>ServerPulse</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vazirmatn@33.0.3/Vazirmatn-font-face.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
@@ -587,63 +726,51 @@ PAGE = """<!doctype html>
   <aside class="glass sidebar">
     <div class="brand">Server<b>Pulse</b></div>
     <nav class="nav">
-      <a href="#overview" data-p="overview"><i>01</i>Overview</a>
-      <a href="#network" data-p="network"><i>02</i>Network</a>
-      <a href="#resources" data-p="resources"><i>03</i>Resources</a>
-      <a href="#latency" data-p="latency"><i>04</i>Latency</a>
-      <a href="#history" data-p="history"><i>05</i>History</a>
-      <a href="#tools" data-p="tools"><i>06</i>Tools</a>
+      <a href="#overview" data-p="overview"><i>01</i><span data-i18n="nav_overview"></span></a>
+      <a href="#network" data-p="network"><i>02</i><span data-i18n="nav_network"></span></a>
+      <a href="#resources" data-p="resources"><i>03</i><span data-i18n="nav_resources"></span></a>
+      <a href="#latency" data-p="latency"><i>04</i><span data-i18n="nav_latency"></span></a>
+      <a href="#history" data-p="history"><i>05</i><span data-i18n="nav_history"></span></a>
+      <a href="#tools" data-p="tools"><i>06</i><span data-i18n="nav_tools"></span></a>
     </nav>
     <div class="side-foot">
-      <div id="status"><span class="dot"></span>Connecting…</div>
-      <a href="logout">Sign out</a>
+      <div id="status"></div>
+      <div class="lang"><button data-lang="en">EN</button><button data-lang="fa">FA</button></div>
+      <a href="logout" data-i18n="signout"></a>
     </div>
   </aside>
 
   <main>
     <section class="page" id="overview">
-      <div class="head"><h1>Overview</h1><p>Live server status, refreshed every 2 seconds</p></div>
+      <div class="head"><h1 data-i18n="h_overview"></h1><p data-i18n="p_overview"></p></div>
       <div class="grid">
-        <div class="glass lift card"><div class="label">CPU</div><div class="value" id="cpu">–</div><div class="meter"><i id="cpuBar"></i></div></div>
-        <div class="glass lift card"><div class="label">Memory</div><div class="value" id="ram">–</div><div class="meter"><i id="ramBar"></i></div></div>
-        <div class="glass lift card"><div class="label">Disk</div><div class="value" id="disk">–</div><div class="meter"><i id="diskBar"></i></div></div>
-        <div class="glass lift card"><div class="label">Average latency</div><div class="value" id="avgPing">–</div></div>
-        <div class="glass lift card"><div class="label">Download</div><div class="value" id="rx">–</div></div>
-        <div class="glass lift card"><div class="label">Upload</div><div class="value" id="tx">–</div></div>
-        <div class="glass lift card"><div class="label">Uptime</div><div class="value sm" id="uptime">–</div><div class="hint" id="load">Load –</div></div>
+        <div class="glass lift card"><div class="label" data-i18n="cpu"></div><div class="value" id="cpu">–</div><div class="meter"><i id="cpuBar"></i></div></div>
+        <div class="glass lift card"><div class="label" data-i18n="memory"></div><div class="value" id="ram">–</div><div class="meter"><i id="ramBar"></i></div></div>
+        <div class="glass lift card"><div class="label" data-i18n="disk"></div><div class="value" id="disk">–</div><div class="meter"><i id="diskBar"></i></div></div>
+        <div class="glass lift card"><div class="label" data-i18n="avg_latency"></div><div class="value" id="avgPing">–</div></div>
+        <div class="glass lift card"><div class="label" data-i18n="download"></div><div class="value" id="rx">–</div></div>
+        <div class="glass lift card"><div class="label" data-i18n="upload"></div><div class="value" id="tx">–</div></div>
+        <div class="glass lift card"><div class="label" data-i18n="uptime"></div><div class="value sm" id="uptime">–</div><div class="hint" id="load"></div></div>
       </div>
       <div class="row2">
-        <div class="glass panel">
-          <h3>Server location</h3>
-          <div class="value sm" id="loc">Loading…</div>
-          <div class="hint" id="isp"></div>
-        </div>
-        <div class="glass panel">
-          <h3>Services</h3>
-          <div class="chips" id="svcList"></div>
-        </div>
+        <div class="glass panel"><h3 data-i18n="loc_title"></h3><div class="value sm" id="loc">–</div><div class="hint" id="isp"></div></div>
+        <div class="glass panel"><h3 data-i18n="services_title"></h3><div class="chips" id="svcList"></div></div>
       </div>
     </section>
 
     <section class="page" id="network">
-      <div class="head"><h1>Network</h1><p>Download and upload throughput, live</p></div>
-      <div class="glass panel">
-        <h3>Traffic <small>KB/s</small></h3>
-        <div class="chart"><canvas id="netChart"></canvas></div>
-      </div>
+      <div class="head"><h1 data-i18n="h_network"></h1><p data-i18n="p_network"></p></div>
+      <div class="glass panel"><h3 data-i18n="ch_traffic"></h3><div class="chart"><canvas id="netChart"></canvas></div></div>
     </section>
 
     <section class="page" id="resources">
-      <div class="head"><h1>Resources</h1><p>CPU and memory usage, and the processes using them</p></div>
+      <div class="head"><h1 data-i18n="h_resources"></h1><p data-i18n="p_resources"></p></div>
+      <div class="glass panel"><h3 data-i18n="ch_cpu_mem"></h3><div class="chart"><canvas id="cpuChart"></canvas></div></div>
       <div class="glass panel">
-        <h3>CPU and memory <small>%</small></h3>
-        <div class="chart"><canvas id="cpuChart"></canvas></div>
-      </div>
-      <div class="glass panel">
-        <h3>Top processes <small>sorted by CPU</small></h3>
+        <h3><span data-i18n="procs_title"></span><small data-i18n="sorted_cpu"></small></h3>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>PID</th><th>Name</th><th>CPU %</th><th>Memory %</th></tr></thead>
+            <thead><tr><th data-i18n="th_pid"></th><th data-i18n="th_name"></th><th data-i18n="th_cpu"></th><th data-i18n="th_mem"></th></tr></thead>
             <tbody id="procBody"></tbody>
           </table>
         </div>
@@ -651,21 +778,15 @@ PAGE = """<!doctype html>
     </section>
 
     <section class="page" id="latency">
-      <div class="head"><h1>Latency</h1><p>Ping to remote targets: 5 packets every 30 seconds</p></div>
-      <div class="glass panel">
-        <h3>Latency by country <small>ms</small></h3>
-        <div class="chart"><canvas id="pingChart"></canvas></div>
-      </div>
+      <div class="head"><h1 data-i18n="h_latency"></h1><p data-i18n="p_latency"></p></div>
+      <div class="glass panel"><h3 data-i18n="lat_title"></h3><div class="chart"><canvas id="pingChart"></canvas></div></div>
       <div class="row2">
+        <div class="glass panel"><h3><span data-i18n="map_title"></span><small data-i18n="map_hint"></small></h3><div id="map"></div></div>
         <div class="glass panel">
-          <h3>Map <small>color = latency</small></h3>
-          <div id="map"></div>
-        </div>
-        <div class="glass panel">
-          <h3>Targets</h3>
+          <h3 data-i18n="targets_title"></h3>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Country</th><th>Service</th><th>IP</th><th>Latency</th><th>Jitter</th><th>Loss</th></tr></thead>
+              <thead><tr><th data-i18n="th_country"></th><th data-i18n="th_service"></th><th data-i18n="th_ip"></th><th data-i18n="th_latency"></th><th data-i18n="th_jitter"></th><th data-i18n="th_loss"></th></tr></thead>
               <tbody id="pingBody"></tbody>
             </table>
           </div>
@@ -674,9 +795,9 @@ PAGE = """<!doctype html>
     </section>
 
     <section class="page" id="history">
-      <div class="head"><h1>History</h1><p>Stored every 60 seconds; kept for 8 days</p></div>
+      <div class="head"><h1 data-i18n="h_history"></h1><p data-i18n="p_history"></p></div>
       <div class="toolbar">
-        <h2>Range</h2>
+        <h2 data-i18n="range"></h2>
         <div class="seg">
           <button data-r="1h" class="on">1h</button>
           <button data-r="24h">24h</button>
@@ -684,49 +805,49 @@ PAGE = """<!doctype html>
         </div>
       </div>
       <div class="row2">
-        <div class="glass panel"><h3>CPU and memory <small>%</small></h3><div class="chart"><canvas id="histCpu"></canvas></div></div>
-        <div class="glass panel"><h3>Network <small>KB/s</small></h3><div class="chart"><canvas id="histNet"></canvas></div></div>
+        <div class="glass panel"><h3 data-i18n="ch_history_cpu"></h3><div class="chart"><canvas id="histCpu"></canvas></div></div>
+        <div class="glass panel"><h3 data-i18n="ch_history_net"></h3><div class="chart"><canvas id="histNet"></canvas></div></div>
       </div>
     </section>
 
     <section class="page" id="tools">
-      <div class="head"><h1>Tools</h1><p>Check an IP address or domain from this server. One check every 3 seconds.</p></div>
+      <div class="head"><h1 data-i18n="h_tools"></h1><p data-i18n="p_tools"></p></div>
       <div class="glass panel">
         <form id="checkForm" class="form-row" autocomplete="off">
-          <div>
-            <label for="host">IP address or domain</label>
-            <input id="host" class="inp" placeholder="203.0.113.10 or example.com" required>
-          </div>
-          <div>
-            <label for="port">TCP port (optional)</label>
-            <input id="port" class="inp" placeholder="443" inputmode="numeric">
-          </div>
-          <button id="checkBtn" class="btn" type="submit">Run check</button>
+          <div><label for="host" data-i18n="tools_host"></label><input id="host" class="inp" required></div>
+          <div><label for="port" data-i18n="tools_port"></label><input id="port" class="inp" inputmode="numeric"></div>
+          <button id="checkBtn" class="btn" type="submit" data-i18n="run_check"></button>
         </form>
         <div class="msg" id="checkMsg"></div>
         <div class="results" id="results" style="display:none">
-          <div><span class="label">Target</span><b id="resHost">–</b></div>
-          <div><span class="label">Average ping</span><b id="resPing">–</b></div>
-          <div><span class="label">Packet loss</span><b id="resLoss">–</b></div>
-          <div><span class="label">TCP port</span><b id="resPort">–</b></div>
+          <div><span class="label" data-i18n="r_target"></span><b id="resHost">–</b></div>
+          <div><span class="label" data-i18n="r_ping"></span><b id="resPing">–</b></div>
+          <div><span class="label" data-i18n="r_loss"></span><b id="resLoss">–</b></div>
+          <div><span class="label" data-i18n="r_port"></span><b id="resPort">–</b></div>
         </div>
       </div>
     </section>
 
-    <footer>ServerPulse v{{version}} · by ArshamSmok</footer>
+    <footer id="footer"></footer>
   </main>
 </div>
 
 <script>
+{{i18n}}
 const $ = id => document.getElementById(id);
+const VERSION = "{{version}}";
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const N = 60;
 const labels = Array(N).fill("");
 const C = { cpu: "#22d3ee", ram: "#a78bfa", rx: "#5eead4", tx: "#fbbf24" };
-const PALETTE = ["#22d3ee", "#a78bfa", "#f472b6", "#fbbf24", "#5eead4", "#94a3b8"];
-const STATE = { active: "#34d399", inactive: "#64748b", failed: "#f87171", activating: "#fbbf24" };
+const PALETTE = ["#22d3ee", "#a78bfa", "#f472b6", "#fbbf24", "#5eead4", "#94a3b8", "#60a5fa", "#fb7185", "#c084fc", "#fcd34d"];
+const ST = { active: "#34d399", inactive: "#64748b", failed: "#f87171", activating: "#fbbf24" };
+let LANG = localStorage.getItem("sp-lang") || "en";
+let LAST = null, ONLINE = null, lastSig = "", lastSvc = "", inFlight = false, histRange = "1h";
+const T = k => (I18N[LANG] && I18N[LANG][k]) || I18N.en[k] || k;
+const cname = t => (LANG === "fa" && t.country_fa) ? t.country_fa : t.country;
 const pingColor = ms => ms === null ? "#64748b" : ms < 80 ? "#34d399" : ms < 200 ? "#fbbf24" : "#f87171";
-const pingText = ms => ms === null ? "timeout" : ms + " ms";
+const pingText = ms => ms === null ? T("timeout") : ms + " ms";
 
 const baseOpts = () => ({
   animation: false, responsive: true, maintainAspectRatio: false,
@@ -744,33 +865,40 @@ const line = (label, color, data) => ({
 const blank = () => Array(N).fill(null);
 
 const cpuChart = new Chart($("cpuChart"), {
-  type: "line", data: { labels, datasets: [line("CPU %", C.cpu, blank()), line("Memory %", C.ram, blank())] }, options: baseOpts()
+  type: "line", data: { labels, datasets: [line(T("ch_cpu"), C.cpu, blank()), line(T("ch_mem"), C.ram, blank())] }, options: baseOpts()
 });
 const netChart = new Chart($("netChart"), {
-  type: "line", data: { labels, datasets: [line("Download", C.rx, blank()), line("Upload", C.tx, blank())] }, options: baseOpts()
+  type: "line", data: { labels, datasets: [line(T("ch_down"), C.rx, blank()), line(T("ch_up"), C.tx, blank())] }, options: baseOpts()
 });
 let pingChart = null;
 function ensurePingChart(targets) {
   if (pingChart) return;
   pingChart = new Chart($("pingChart"), {
     type: "line",
-    data: { labels, datasets: targets.map((t, i) => ({ ...line(t.country, PALETTE[i % PALETTE.length], blank()), fill: false })) },
+    data: { labels, datasets: targets.map((t, i) => ({ ...line(cname(t), PALETTE[i % PALETTE.length], blank()), fill: false })) },
     options: baseOpts()
   });
 }
 const histCpu = new Chart($("histCpu"), {
-  type: "line", data: { labels: [], datasets: [line("CPU %", C.cpu, []), line("Memory %", C.ram, [])] }, options: baseOpts()
+  type: "line", data: { labels: [], datasets: [line(T("ch_cpu"), C.cpu, []), line(T("ch_mem"), C.ram, [])] }, options: baseOpts()
 });
 const histNet = new Chart($("histNet"), {
-  type: "line", data: { labels: [], datasets: [line("Download", C.rx, []), line("Upload", C.tx, [])] }, options: baseOpts()
+  type: "line", data: { labels: [], datasets: [line(T("ch_down"), C.rx, []), line(T("ch_up"), C.tx, [])] }, options: baseOpts()
 });
 
-let histRange = "1h";
+function relabel() {
+  const set = (ch, keys) => { keys.forEach((k, i) => ch.data.datasets[i].label = T(k)); ch.update("none"); };
+  set(cpuChart, ["ch_cpu", "ch_mem"]);
+  set(netChart, ["ch_down", "ch_up"]);
+  set(histCpu, ["ch_cpu", "ch_mem"]);
+  set(histNet, ["ch_down", "ch_up"]);
+}
+
 function fmtLabel(ts, range) {
-  const d = new Date(ts * 1000);
+  const d = new Date(ts * 1000), loc = LANG === "fa" ? "fa-IR" : "en-US";
   return range === "7d"
-    ? d.toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit" })
-    : d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+    ? d.toLocaleString(loc, { month: "short", day: "numeric", hour: "2-digit" })
+    : d.toLocaleTimeString(loc, { hour: "2-digit", minute: "2-digit" });
 }
 async function loadHistory() {
   if (document.hidden) return;
@@ -797,9 +925,7 @@ document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click"
 }));
 
 const map = L.map("map").setView([20, 0], 2);
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 6, attribution: "© OpenStreetMap"
-}).addTo(map);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 6, attribution: "© OpenStreetMap" }).addTo(map);
 const mapLayer = L.layerGroup().addTo(map);
 let fitted = false;
 
@@ -810,7 +936,7 @@ function renderMap(sv, targets) {
   if (hasServer) {
     pts.push([sv.lat, sv.lon]);
     L.circleMarker([sv.lat, sv.lon], { radius: 7, color: "#fff", weight: 2, fillColor: "#34d399", fillOpacity: 1 })
-      .bindTooltip("Server: " + sv.city + ", " + sv.country).addTo(mapLayer);
+      .bindTooltip(sv.city + ", " + sv.country).addTo(mapLayer);
   }
   targets.forEach(t => {
     if (t.lat == null) return;
@@ -820,7 +946,7 @@ function renderMap(sv, targets) {
       L.polyline([[sv.lat, sv.lon], [t.lat, t.lng]], { color: c, weight: 1.5, opacity: .55, dashArray: "6 6" }).addTo(mapLayer);
     }
     L.circleMarker([t.lat, t.lng], { radius: 6, color: "#fff", weight: 2, fillColor: c, fillOpacity: 1 })
-      .bindTooltip(t.country + ": " + pingText(t.avg)).addTo(mapLayer);
+      .bindTooltip(cname(t) + ": " + pingText(t.avg)).addTo(mapLayer);
   });
   if (!fitted && pts.length > 1) {
     map.fitBounds(pts, { padding: [30, 30], maxZoom: 4 });
@@ -830,29 +956,33 @@ function renderMap(sv, targets) {
 
 function renderTable(targets) {
   $("pingBody").innerHTML = targets.map(t =>
-    `<tr><td><span class="code">${esc(t.code)}</span>${esc(t.country)}</td><td>${esc(t.name)}</td><td>${esc(t.ip)}</td>` +
-    `<td><span class="pd" style="background:${pingColor(t.avg)}"></span>${pingText(t.avg)}</td>` +
-    `<td>${t.jitter === null ? "–" : t.jitter + " ms"}</td>` +
-    `<td>${t.loss === null ? "–" : t.loss.toFixed(1) + "%"}</td></tr>`
+    `<tr><td><span class="code">${esc(t.code)}</span>${esc(cname(t))}</td><td>${esc(t.name)}</td>` +
+    `<td class="num">${esc(t.ip)}</td>` +
+    `<td class="num"><span class="pd" style="background:${pingColor(t.avg)}"></span>${pingText(t.avg)}</td>` +
+    `<td class="num">${t.jitter === null ? "–" : t.jitter + " ms"}</td>` +
+    `<td class="num">${t.loss === null ? "–" : t.loss.toFixed(1) + "%"}</td></tr>`
   ).join("");
 }
 
 function renderServices(list) {
   $("svcList").innerHTML = list.length
-    ? list.map(s => `<span class="chip"><span class="pd" style="margin:0 8px 0 0;background:${STATE[s.state] || "#64748b"}"></span>${esc(s.name)} · ${esc(s.state)}</span>`).join("")
-    : '<span class="hint">No services configured</span>';
+    ? list.map(s => {
+        const st = T("st_" + s.state) || s.state;
+        return `<span class="chip"><span class="pd" style="margin-inline-end:8px;background:${ST[s.state] || "#64748b"}"></span>${esc(s.name)} · ${esc(st)}</span>`;
+      }).join("")
+    : `<span class="hint">${T("no_services")}</span>`;
 }
 
 function renderProcs(list) {
   $("procBody").innerHTML = list.length
-    ? list.map(p => `<tr><td>${p.pid}</td><td>${esc(p.name)}</td><td>${p.cpu.toFixed(1)}</td><td>${p.mem.toFixed(1)}</td></tr>`).join("")
-    : '<tr><td colspan="4">Collecting data…</td></tr>';
+    ? list.map(p => `<tr><td class="num">${p.pid}</td><td>${esc(p.name)}</td><td class="num">${p.cpu.toFixed(1)}</td><td class="num">${p.mem.toFixed(1)}</td></tr>`).join("")
+    : `<tr><td colspan="4">${T("collecting")}</td></tr>`;
 }
 
 function renderLoc(sv) {
   if (!sv) {
-    $("loc").textContent = "Unknown";
-    $("isp").textContent = "Location lookup unavailable (no internet access or ip-api limit)";
+    $("loc").textContent = T("loc_unknown");
+    $("isp").textContent = T("loc_unavail");
     return;
   }
   $("loc").textContent = sv.city + ", " + sv.country;
@@ -864,17 +994,64 @@ const fmtRate = b => {
   while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
   return b.toFixed(1) + " " + u[i];
 };
-const fmtUptime = s => `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+const fmtUptime = s => {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return LANG === "fa" ? `${d} روز ${h} ساعت ${m} دقیقه` : `${d}d ${h}h ${m}m`;
+};
 const setBar = (id, pct) => $(id).style.width = Math.min(pct, 100) + "%";
 const push = (chart, vals) => {
   chart.data.datasets.forEach((d, i) => { d.data.push(vals[i]); d.data.shift(); });
   chart.update("none");
 };
 function setStatus(online) {
-  $("status").innerHTML = online
-    ? '<span class="dot"></span>Online'
-    : '<span class="dot" style="background:#f87171"></span>Disconnected';
+  ONLINE = online;
+  const dot = online === null ? "#64748b" : online ? "#34d399" : "#f87171";
+  const text = online === null ? T("connecting") : online ? T("online") : T("disconnected");
+  $("status").innerHTML = `<span class="dot" style="background:${dot}"></span>${text}`;
 }
+
+// Redraws text and the tables/map from the latest snapshot (also used after a language change)
+function paint(s, force) {
+  $("cpu").textContent = s.cpu.toFixed(1) + "%";
+  $("ram").textContent = s.ram.toFixed(1) + "%";
+  $("disk").textContent = s.disk.toFixed(1) + "%";
+  setBar("cpuBar", s.cpu); setBar("ramBar", s.ram); setBar("diskBar", s.disk);
+  $("rx").textContent = fmtRate(s.rx);
+  $("tx").textContent = fmtRate(s.tx);
+  $("uptime").textContent = fmtUptime(s.uptime);
+  $("load").textContent = T("load") + " " + s.load.join(" · ");
+  $("avgPing").textContent = s.ping_avg === null ? T("timeout") : s.ping_avg.toFixed(1) + " ms";
+  renderServices(s.services);
+  renderProcs(s.top);
+  renderLoc(s.server);
+  const sig = JSON.stringify([s.targets.map(t => [t.avg, t.jitter, t.loss]), s.server]);
+  if (force || sig !== lastSig) {
+    renderTable(s.targets);
+    renderMap(s.server, s.targets);
+    lastSig = sig;
+  }
+  if (pingChart) {
+    pingChart.data.datasets.forEach((d, i) => { if (s.targets[i]) d.label = cname(s.targets[i]); });
+    pingChart.update("none");
+  }
+}
+
+function applyLang() {
+  document.documentElement.lang = LANG;
+  document.documentElement.dir = LANG === "fa" ? "rtl" : "ltr";
+  document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = T(el.dataset.i18n));
+  document.querySelectorAll(".lang button").forEach(b => b.classList.toggle("on", b.dataset.lang === LANG));
+  $("footer").textContent = T("footer").replace("{v}", VERSION);
+  relabel();
+  setStatus(ONLINE);
+  if (LAST) paint(LAST, true);
+  loadHistory();
+}
+document.querySelectorAll(".lang button").forEach(b => b.addEventListener("click", () => {
+  LANG = b.dataset.lang;
+  localStorage.setItem("sp-lang", LANG);
+  applyLang();
+}));
 
 const pages = ["overview", "network", "resources", "latency", "history", "tools"];
 function showPage(name) {
@@ -885,7 +1062,6 @@ function showPage(name) {
   window.scrollTo(0, 0);
 }
 window.addEventListener("hashchange", () => showPage(location.hash.slice(1)));
-showPage(location.hash.slice(1) || "overview");
 
 $("checkForm").addEventListener("submit", async e => {
   e.preventDefault();
@@ -899,23 +1075,19 @@ $("checkForm").addEventListener("submit", async e => {
       body: JSON.stringify({ host: $("host").value, port: $("port").value })
     });
     const d = await r.json();
-    if (!r.ok) { $("checkMsg").textContent = d.error || "Check failed"; return; }
+    if (!r.ok) { $("checkMsg").textContent = T("e_" + (d.error === "rate" ? "rate" : d.error)); return; }
     $("resHost").textContent = d.host;
-    $("resPing").textContent = d.ping_avg === null ? "timeout" : d.ping_avg + " ms";
+    $("resPing").textContent = d.ping_avg === null ? T("timeout") : d.ping_avg + " ms";
     $("resLoss").textContent = d.loss.toFixed(0) + "%";
-    $("resPort").textContent = d.port === null ? "not tested"
-      : d.port_open ? "open · " + d.port_ms + " ms" : "closed";
+    $("resPort").textContent = d.port === null ? T("not_tested")
+      : d.port_open ? T("open") + " · " + d.port_ms + " ms" : T("closed");
     $("results").style.display = "grid";
   } catch (err) {
-    $("checkMsg").textContent = "Request failed. Check the server connection.";
+    $("checkMsg").textContent = T("e_request");
   } finally {
     btn.disabled = false;
   }
 });
-
-let inFlight = false;
-let lastSig = "";
-let lastSvc = "";
 
 async function tick() {
   if (document.hidden || inFlight) return;
@@ -927,33 +1099,12 @@ async function tick() {
     if (r.status === 401) { location.href = "login"; return; }
     if (r.status === 503) return;
     const s = await r.json();
-
-    $("cpu").textContent = s.cpu.toFixed(1) + "%";
-    $("ram").textContent = s.ram.toFixed(1) + "%";
-    $("disk").textContent = s.disk.toFixed(1) + "%";
-    setBar("cpuBar", s.cpu); setBar("ramBar", s.ram); setBar("diskBar", s.disk);
-    $("rx").textContent = fmtRate(s.rx);
-    $("tx").textContent = fmtRate(s.tx);
-    $("uptime").textContent = fmtUptime(s.uptime);
-    $("load").textContent = "Load " + s.load.join(" · ");
-    $("avgPing").textContent = s.ping_avg === null ? "timeout" : s.ping_avg.toFixed(1) + " ms";
-
-    const svcSig = JSON.stringify(s.services);
-    if (svcSig !== lastSvc) { renderServices(s.services); lastSvc = svcSig; }
-    renderProcs(s.top);
-    renderLoc(s.server);
-
+    LAST = s;
     ensurePingChart(s.targets);
     push(cpuChart, [s.cpu, s.ram]);
     push(netChart, [s.rx / 1024, s.tx / 1024]);
     push(pingChart, s.targets.map(t => t.avg));
-
-    const sig = JSON.stringify([s.targets.map(t => [t.avg, t.jitter, t.loss]), s.server]);
-    if (sig !== lastSig) {
-      renderTable(s.targets);
-      renderMap(s.server, s.targets);
-      lastSig = sig;
-    }
+    paint(s, false);
     setStatus(true);
   } catch (e) {
     setStatus(false);
@@ -966,10 +1117,11 @@ async function tick() {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) { tick(); loadHistory(); }
 });
+applyLang();
+showPage(location.hash.slice(1) || "overview");
 setInterval(tick, 2000);
 setInterval(loadHistory, 60000);
 tick();
-loadHistory();
 </script>
 </body>
 </html>"""
@@ -980,7 +1132,7 @@ def login():
     error = ""
     if request.method == "POST":
         if time.time() < _login_state["until"]:
-            error = "Too many failed attempts. Try again in a minute."
+            error = "locked"
         else:
             user = request.form.get("username", "")
             pwd = request.form.get("password", "")
@@ -994,11 +1146,14 @@ def login():
             if _login_state["fails"] >= 5:
                 _login_state["until"] = time.time() + 60
                 _login_state["fails"] = 0
-            error = "Invalid username or password"
+                error = "locked"
+            else:
+                error = "invalid"
     html = (LOGIN_PAGE
             .replace("{{login_css}}", LOGIN_CSS)
             .replace("{{base}}", BASE_CSS)
             .replace("{{bg}}", BG_LAYER)
+            .replace("{{i18n}}", I18N_JS)
             .replace("{{error}}", error))
     return Response(html, mimetype="text/html")
 
@@ -1016,6 +1171,7 @@ def index():
             .replace("{{page_css}}", PAGE_CSS)
             .replace("{{base}}", BASE_CSS)
             .replace("{{bg}}", BG_LAYER)
+            .replace("{{i18n}}", I18N_JS)
             .replace("{{version}}", VERSION))
     return Response(html, mimetype="text/html")
 
